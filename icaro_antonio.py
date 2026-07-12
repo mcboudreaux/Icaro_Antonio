@@ -6,16 +6,22 @@ Autoras: Maria Carolina Boudreaux Ramirez Deleito / Raquel Maria Boudreaux Ramir
 
 Como executar:
     pip install -r requirements.txt
-    export OPENAI_API_KEY="sua_chave_aqui"      (ou configure em .streamlit/secrets.toml)
-    streamlit run icaro_antonio.py
+    export GEMINI_API_KEY="sua_chave_aqui"      (opção gratuita, padrão — ou configure em .streamlit/secrets.toml)
+    streamlit run icaro_antonio_final.py
 
-O agente não entrega a resposta final pronta. Ele conduz o estudante por
+Provedor de IA:
+    Por padrão o app usa a API gratuita do Google Gemini (modelo gemini-3.5-flash),
+    através do endpoint compatível com a biblioteca OpenAI — não é necessário cartão
+    de crédito. Também é possível trocar para a API paga da OpenAI na barra lateral,
+    caso o grupo prefira.
+
+O agente NUNCA entrega a resposta final pronta. Ele conduz o estudante por
 quatro etapas de mediação pedagógica:
 
-    1. Explicação teórica: conecta o problema a conceitos que o aluno já deveria dominar
-    2. Passos de resolução: sugere um caminho, sem entregar a solução final
-    3. Resposta do aluno: o estudante constrói e envia sua própria solução
-    4. Feedback construtivo: analisa a resposta e orienta o avanço, sem corrigir "pronto"
+    1. Explicação teórica   — conecta o problema a conceitos que o aluno já deveria dominar
+    2. Passos de resolução  — sugere um caminho, sem entregar a solução final
+    3. Resposta do aluno    — o estudante constrói e envia sua própria solução
+    4. Feedback construtivo — analisa a resposta e orienta o avanço, sem corrigir "pronto"
 """
 
 import os
@@ -29,7 +35,22 @@ from openai import OpenAI
 
 APP_TITLE = "Ícaro Antônio"
 APP_SUBTITLE = "Agente de IA para Aprendizagem Guiada e Feedback Educacional"
-DEFAULT_MODEL = "gpt-4o-mini"
+
+# Provedores suportados: nome de exibição -> configuração
+PROVIDERS = {
+    "Google Gemini (grátis)": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "env_key": "GEMINI_API_KEY",
+        "models": ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3.1-pro-preview"],
+        "get_key_url": "https://aistudio.google.com/api-keys",
+    },
+    "OpenAI (pago)": {
+        "base_url": None,  
+        "env_key": "OPENAI_API_KEY",
+        "models": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"],
+        "get_key_url": "https://platform.openai.com/api-keys",
+    },
+}
 
 SYSTEM_PROMPT = """\
 Você é "Ícaro Antônio", um agente de IA educacional para estudantes de \
@@ -92,27 +113,32 @@ STAGE_LABELS = [
 ]
 
 # Utilidades
-
-def get_client():
-    """Obtém a chave de API a partir de st.secrets, variável de ambiente ou input manual."""
-    api_key = None
+def get_secret(name: str):
     try:
-        api_key = st.secrets.get("OPENAI_API_KEY")
+        val = st.secrets.get(name)
+        if val:
+            return val
     except Exception:
-        api_key = None
-    if not api_key:
-        api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        api_key = st.session_state.get("manual_api_key")
+        pass
+    return os.environ.get(name)
+
+
+def get_client(provider_name: str):
+    """Monta o client OpenAI apontando para o provedor escolhido (Gemini ou OpenAI)."""
+    cfg = PROVIDERS[provider_name]
+    api_key = get_secret(cfg["env_key"]) or st.session_state.get(f"manual_key_{cfg['env_key']}")
     if not api_key:
         return None
-    return OpenAI(api_key=api_key)
+    kwargs = {"api_key": api_key}
+    if cfg["base_url"]:
+        kwargs["base_url"] = cfg["base_url"]
+    return OpenAI(**kwargs)
 
 
 def export_conversation_txt() -> str:
     """Gera um .txt com a conversa completa, para uso na análise qualitativa do relatório."""
     buf = io.StringIO()
-    buf.write(f"Conversa com Ícaro Antônio: exportado em {dt.datetime.now():%Y-%m-%d %H:%M}\n")
+    buf.write(f"Conversa com Ícaro Antônio — exportado em {dt.datetime.now():%Y-%m-%d %H:%M}\n")
     buf.write("=" * 70 + "\n\n")
     for msg in st.session_state.messages:
         if msg["role"] == "system":
@@ -122,10 +148,8 @@ def export_conversation_txt() -> str:
     return buf.getvalue()
 
 
-
 # Interface Streamlit
-
-st.set_page_config(page_title=APP_TITLE, page_icon="👼", layout="centered")
+st.set_page_config(page_title=APP_TITLE, page_icon="🤓", layout="centered")
 
 if "messages" not in st.session_state:
     st.session_state.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -136,21 +160,28 @@ if "turn_count" not in st.session_state:
 with st.sidebar:
     st.header("⚙️ Configuração")
 
-    has_env_key = bool(os.environ.get("OPENAI_API_KEY"))
-    has_secret_key = False
-    try:
-        has_secret_key = bool(st.secrets.get("OPENAI_API_KEY", None))
-    except Exception:
-        has_secret_key = False
+    provider_name = st.selectbox("Provedor de IA", list(PROVIDERS.keys()), index=0)
+    cfg = PROVIDERS[provider_name]
 
-    if not has_env_key and not has_secret_key:
-        st.session_state.manual_api_key = st.text_input(
-            "Chave da API OpenAI", type="password",
-            help="Necessária apenas se OPENAI_API_KEY não estiver configurada como variável de ambiente ou secret.",
+    if not get_secret(cfg["env_key"]):
+        st.session_state[f"manual_key_{cfg['env_key']}"] = st.text_input(
+            f"Chave de API ({cfg['env_key']})", type="password",
+            help=(
+                f"Não encontrada como variável de ambiente/secret. Obtenha uma chave "
+                f"gratuita em {cfg['get_key_url']}."
+            ),
         )
+        st.caption(f"🔑 Criar chave: {cfg['get_key_url']}")
 
-    model = st.selectbox("Modelo", [DEFAULT_MODEL, "gpt-4o", "gpt-4.1-mini"], index=0)
+    model = st.selectbox("Modelo", cfg["models"], index=0)
     temperature = st.slider("Temperatura", 0.0, 1.0, 0.4, 0.1)
+
+    if provider_name.startswith("Google"):
+        st.caption(
+            "ℹ️ No nível gratuito do Gemini, o conteúdo das conversas pode ser usado "
+            "pelo Google para melhorar seus produtos. Evite compartilhar dados "
+            "sensíveis durante o piloto."
+        )
 
     st.divider()
     st.caption("Etapa atual do fluxo pedagógico")
@@ -174,15 +205,16 @@ with st.sidebar:
 
     st.divider()
     st.caption(
-        "Após a sessão, responda ao questionário de avaliação (Google Forms) "
-        "sobre utilidade, clareza e contribuição para o aprendizado."
+        "Após a sessão, responda ao questionário de avaliação sobre utilidade, "
+        "clareza e contribuição para o aprendizado: "
+        "[clique aqui](https://forms.gle/BJFM98yvtF6hcstq7)"
     )
 
-st.title(f"👼 {APP_TITLE}")
+st.title(f"🤓 {APP_TITLE}")
 st.caption(APP_SUBTITLE)
 st.info(
     "Traga uma questão de exatas (cálculo, física, programação, álgebra "
-    "linear...). Ícaro Antônio não dará a resposta pronta — ele vai te "
+    "linear...). Ícaro Antônio não dará a resposta pronta, ele vai te "
     "guiar até você mesmo chegar lá.",
     icon="💡",
 )
@@ -190,18 +222,18 @@ st.info(
 for msg in st.session_state.messages:
     if msg["role"] == "system":
         continue
-    with st.chat_message("user" if msg["role"] == "user" else "assistant", avatar="🧑‍🎓" if msg["role"] == "user" else "👼"):
+    with st.chat_message("user" if msg["role"] == "user" else "assistant", avatar="🧑‍🎓" if msg["role"] == "user" else "🦉"):
         st.markdown(msg["content"])
 
 prompt = st.chat_input("Digite sua questão ou sua resposta...")
 
 if prompt:
-    client = get_client()
+    client = get_client(provider_name)
     if client is None:
         st.error(
-            "Nenhuma chave de API configurada. Defina OPENAI_API_KEY como "
-            "variável de ambiente, em .streamlit/secrets.toml, ou informe-a "
-            "na barra lateral."
+            f"Nenhuma chave de API configurada para {provider_name}. Defina "
+            f"{cfg['env_key']} como variável de ambiente, em .streamlit/secrets.toml, "
+            "ou informe-a na barra lateral."
         )
         st.stop()
 
@@ -210,7 +242,7 @@ if prompt:
     with st.chat_message("user", avatar="🧑‍🎓"):
         st.markdown(prompt)
 
-    with st.chat_message("assistant", avatar="👼"):
+    with st.chat_message("assistant", avatar="🤓"):
         placeholder = st.empty()
         full_response = ""
         try:
@@ -226,7 +258,7 @@ if prompt:
                 placeholder.markdown(full_response + "▌")
             placeholder.markdown(full_response)
         except Exception as e:
-            full_response = f"⚠️ Erro ao chamar a API: {e}"
+            full_response = f"⚠️ Erro ao chamar a API ({provider_name}): {e}"
             placeholder.error(full_response)
 
     st.session_state.messages.append({"role": "assistant", "content": full_response})
