@@ -26,10 +26,13 @@ quatro etapas de mediação pedagógica:
 
 import os
 import io
+import re
 import datetime as dt
 
 import streamlit as st
 from openai import OpenAI
+
+STAGE_TAG_RE = re.compile(r"^\s*\[\[ETAPA:(\d)\]\]\s*")
 
 # Configuração geral
 
@@ -103,6 +106,19 @@ pelo aluno (personalização/sistemas adaptativos).
 - Ao final de uma interação bem-sucedida (problema resolvido corretamente \
 pelo aluno), pergunte se ele quer trazer um novo problema.
 - Sempre responda em português do Brasil.
+
+CONTROLE DE ETAPA (uso interno, invisível ao estudante):
+No INÍCIO de toda resposta sua, sem exceção, inclua uma das marcações abaixo, \
+exatamente neste formato, antes de qualquer outra palavra:
+- [[ETAPA:2]] → use quando esta resposta traz a explicação teórica e/ou os \
+passos de resolução e você está aguardando a tentativa do estudante, inclua \
+também quando o estudante errou ou ficou incompleto e você está pedindo uma \
+nova tentativa (retorno à etapa 3).
+- [[ETAPA:4]] → use somente quando esta resposta confirma que o estudante \
+acertou o problema (feedback final de um ciclo concluído).
+Essa marcação é removida automaticamente antes de ser exibida ao estudante. \
+Nunca a explique, comente ou mencione no corpo do texto, ela deve aparecer \
+apenas uma vez, isolada, no começo absoluto da mensagem.
 """
 
 STAGE_LABELS = [
@@ -138,7 +154,7 @@ def get_client(provider_name: str):
 def export_conversation_txt() -> str:
     """Gera um .txt com a conversa completa, para uso na análise qualitativa do relatório."""
     buf = io.StringIO()
-    buf.write(f"Conversa com Ícaro Antônio — exportado em {dt.datetime.now():%Y-%m-%d %H:%M}\n")
+    buf.write(f"Conversa com Ícaro Antônio exportado em {dt.datetime.now():%Y-%m-%d %H:%M}\n")
     buf.write("=" * 70 + "\n\n")
     for msg in st.session_state.messages:
         if msg["role"] == "system":
@@ -154,8 +170,8 @@ st.set_page_config(page_title=APP_TITLE, page_icon="🤓", layout="centered")
 if "messages" not in st.session_state:
     st.session_state.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-if "turn_count" not in st.session_state:
-    st.session_state.turn_count = 0
+if "completed_stage" not in st.session_state:
+    st.session_state.completed_stage = 0
 
 with st.sidebar:
     st.header("⚙️ Configuração")
@@ -185,14 +201,20 @@ with st.sidebar:
 
     st.divider()
     st.caption("Etapa atual do fluxo pedagógico")
-    stage_idx = min(st.session_state.turn_count, 3)
-    for i, label in enumerate(STAGE_LABELS):
-        st.markdown(f"{'✅' if i < stage_idx else ('▶️' if i == stage_idx else '⬜')} {label}")
+    completed = st.session_state.completed_stage
+    for i, label in enumerate(STAGE_LABELS, start=1):
+        if i <= completed:
+            icon = "✅"
+        elif i == completed + 1:
+            icon = "▶️"
+        else:
+            icon = "⬜"
+        st.markdown(f"{icon} {label}")
 
     st.divider()
     if st.button("🔄 Reiniciar conversa"):
         st.session_state.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        st.session_state.turn_count = 0
+        st.session_state.completed_stage = 0
         st.rerun()
 
     if len(st.session_state.messages) > 1:
@@ -222,7 +244,7 @@ st.info(
 for msg in st.session_state.messages:
     if msg["role"] == "system":
         continue
-    with st.chat_message("user" if msg["role"] == "user" else "assistant", avatar="🧑‍🎓" if msg["role"] == "user" else "🦉"):
+    with st.chat_message("user" if msg["role"] == "user" else "assistant", avatar="🧑‍🎓" if msg["role"] == "user" else "🤓"):
         st.markdown(msg["content"])
 
 prompt = st.chat_input("Digite sua questão ou sua resposta...")
@@ -238,13 +260,15 @@ if prompt:
         st.stop()
 
     st.session_state.messages.append({"role": "user", "content": prompt})
-    st.session_state.turn_count += 1
     with st.chat_message("user", avatar="🧑‍🎓"):
         st.markdown(prompt)
 
     with st.chat_message("assistant", avatar="🤓"):
         placeholder = st.empty()
-        full_response = ""
+        raw_response = ""      
+        visible_response = ""  
+        tag_resolved = False   
+        detected_stage = None
         try:
             stream = client.chat.completions.create(
                 model=model,
@@ -254,11 +278,43 @@ if prompt:
             )
             for chunk in stream:
                 delta = chunk.choices[0].delta.content or ""
-                full_response += delta
-                placeholder.markdown(full_response + "▌")
-            placeholder.markdown(full_response)
-        except Exception as e:
-            full_response = f"⚠️ Erro ao chamar a API ({provider_name}): {e}"
-            placeholder.error(full_response)
+                if not delta:
+                    continue
+                raw_response += delta
 
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+                if not tag_resolved:
+                    m = STAGE_TAG_RE.match(raw_response)
+                    if m:
+                        detected_stage = int(m.group(1))
+                        visible_response = raw_response[m.end():]
+                        tag_resolved = True
+                        placeholder.markdown(visible_response + "▌")
+                    elif len(raw_response) > 20 and "]]" not in raw_response:
+                        tag_resolved = True
+                        visible_response = raw_response
+                        placeholder.markdown(visible_response + "▌")
+                else:
+                    visible_response += delta
+                    placeholder.markdown(visible_response + "▌")
+
+            if not tag_resolved:
+                m = STAGE_TAG_RE.match(raw_response)
+                if m:
+                    detected_stage = int(m.group(1))
+                    visible_response = raw_response[m.end():]
+                else:
+                    visible_response = raw_response
+
+            visible_response = visible_response.lstrip()
+            placeholder.markdown(visible_response)
+        except Exception as e:
+            visible_response = f"⚠️ Erro ao chamar a API ({provider_name}): {e}"
+            placeholder.error(visible_response)
+
+    if detected_stage in (2, 4):
+        just_finished = detected_stage == 4 and st.session_state.completed_stage != 4
+        st.session_state.completed_stage = detected_stage
+        if just_finished:
+            st.toast("🎉 Problema concluído! Pronto para o próximo.", icon="✅")
+
+    st.session_state.messages.append({"role": "assistant", "content": visible_response})
